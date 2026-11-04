@@ -1,0 +1,8 @@
+# raw Search Console exports
+*.zip
+exports/
+*.csv
+!examples/*.csv
+# reports you generate locally
+striking-distance-report.md
+__pycache__/
