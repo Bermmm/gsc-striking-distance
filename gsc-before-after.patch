@@ -1,0 +1,247 @@
+diff --git a/README.md b/README.md
+index 4540791..7161fb5 100644
+--- a/README.md
++++ b/README.md
+@@ -41,6 +41,19 @@ python3 gsc_striking_distance.py export.zip \
+ 
+ Needs Python 3.8+.
+ 
++## Measure a page after an SEO edit
++
++Export two separate periods for the same Search Console property with the same filters. For example, use the 28 days before a title change and the 28 days after it. Pass the later export first and the earlier one after `--before`.
++
++```bash
++python3 gsc_striking_distance.py after.zip --before before.zip \
++  --page 'https://carlens.ca/blog/how-to-negotiate-a-used-car-price-canada'
++```
++
++Open `page-comparison.md` to see clicks, impressions, CTR and average position before and after, with the change beside each pair. Copy the exact page URL from `Pages.csv`. A dash means a value is unavailable. A row missing from one export has unknown performance for that period.
++
++Leave out `--page` to follow all earlier striking-distance pages, including ones that later move above or below the ranking window. Markdown shows the first `--top` pages (15 by default). Add `--csv out/` for the full list in `out/page-comparison.csv`. CTR changes are in percentage points, and a move from position 9.6 to 6.1 is a change of −3.5. These are observed changes across the two periods. Other factors can affect search performance over the same dates.
++
+ ## Real example
+ 
+ [`examples/carlens-report.md`](examples/carlens-report.md) is the output for [carlens.ca](https://carlens.ca), a used-car listing checker I built, using 3 months of data (Aug–Oct 2026). Highlights:
+diff --git a/gsc_striking_distance.py b/gsc_striking_distance.py
+index 45561c4..624b8f4 100644
+--- a/gsc_striking_distance.py
++++ b/gsc_striking_distance.py
+@@ -48,7 +48,8 @@ def read_export(path):
+                     tables[Path(name).name.lower()] = list(csv.DictReader(io.StringIO(text)))
+     elif path.is_dir():
+         for f in path.glob("*.csv"):
+-            tables[f.name.lower()] = list(csv.DictReader(f.open(encoding="utf-8-sig")))
++            with f.open(encoding="utf-8-sig", newline="") as source:
++                tables[f.name.lower()] = list(csv.DictReader(source))
+     else:
+         sys.exit(f"Not a .zip or folder: {path}")
+     return tables
+@@ -176,6 +177,103 @@ def md_table(headers, rows):
+     return "\n".join(lines)
+ 
+ 
++def comparison_pages(tables, label):
++    rows = tables.get("pages.csv")
++    if rows is None:
++        sys.exit(f"{label} export is missing Pages.csv. Use a standard Search results export.")
++    required = {"Top pages", "Clicks", "Impressions", "Position"}
++    if rows and not required.issubset(rows[0]):
++        sys.exit(f"{label} Pages.csv needs the columns: {', '.join(sorted(required))}.")
++    pages = {}
++    for row in normalize(rows, "Top pages"):
++        pages[row["key"]] = {
++            "clicks": row["clicks"],
++            "impressions": row["impressions"],
++            "ctr_pct": 100 * row["ctr"] if row["impressions"] else None,
++            "position": row["position"] if row["impressions"] and row["position"] > 0 else None,
++            "key": row["key"],
++        }
++    return pages
++
++
++def period_dates(tables):
++    values = [r.get("Date") for r in tables.get("chart.csv", [])]
++    try:
++        days = [date.fromisoformat(value) for value in values]
++    except (ValueError, TypeError):
++        return None
++    return (min(days), max(days)) if days else None
++
++
++def compare_exports(before, after, args):
++    earlier = comparison_pages(before, "Before")
++    later = comparison_pages(after, "After")
++    if args.page:
++        keys = [args.page]
++        if args.page not in earlier and args.page not in later:
++            sys.exit("Page missing from both exports. Copy the full URL from Pages.csv.")
++    else:
++        ranked = (row for row in earlier.values() if row["position"] is not None)
++        opportunities = striking_distance(ranked, args.min_pos, args.max_pos,
++                                          args.min_impr, args.target)
++        keys = [row["key"] for row in opportunities]
++
++    periods = [period_dates(before), period_dates(after)]
++    report = ["# Before-and-after page comparison", ""]
++    for label, path, dates in zip(("Before", "After"), (args.before, args.export), periods):
++        span = f"{dates[0]} to {dates[1]}" if dates else "dates unavailable"
++        report.append(f"- {label}: {Path(path).name} ({span})")
++    report.append("")
++    if all(periods):
++        (start, end), (next_start, next_end) = periods
++        if next_start <= end:
++            report += ["The periods overlap or are out of order. "
++                       "Use separate, chronological windows for follow-up.", ""]
++        if end - start != next_end - next_start:
++            report += ["The windows have different lengths. Clicks and impressions are raw totals.", ""]
++
++    if not args.page:
++        report += [f"Tracking {len(keys)} pages in the earlier striking-distance ranking. "
++                   f"Showing up to {args.top} in the original priority order.", ""]
++    report += ["Values show before → after (change). CTR change is in percentage points. "
++               "A negative position change means the page moved up. "
++               "A dash means the metric is unavailable.", ""]
++
++    metrics = (("clicks", "Clicks", ",d"), ("impressions", "Impressions", ",d"),
++               ("ctr_pct", "CTR", ".2f"), ("position", "Avg. position", ".1f"))
++    output_rows, table = [], []
++    for key in keys:
++        row = {"page": key}
++        cells = [key.replace("|", r"\|")]
++        for field, _, fmt in metrics:
++            old = earlier.get(key, {}).get(field)
++            new = later.get(key, {}).get(field)
++            row[f"{field}_before"] = old
++            row[f"{field}_after"] = new
++            delta = new - old if old is not None and new is not None else None
++            row[f"{field}_change"] = delta
++            suffix = "%" if field == "ctr_pct" else ""
++            pair = " → ".join("—" if v is None else format(v, fmt) + suffix for v in (old, new))
++            if delta is not None:
++                unit = " pp" if field == "ctr_pct" else ""
++                pair += f" ({delta:+{fmt}}{unit})"
++            cells.append(pair)
++        output_rows.append(row)
++        table.append(cells)
++
++    if table:
++        report.append(md_table(["Page"] + [name for _, name, _ in metrics], table[:args.top]))
++    else:
++        report.append("No pages met the earlier striking-distance filters.")
++    if args.csv:
++        directory = Path(args.csv)
++        directory.mkdir(parents=True, exist_ok=True)
++        fields = ["page"] + [f"{field}_{part}" for field, _, _ in metrics
++                             for part in ("before", "after", "change")]
++        write_csv(directory / "page-comparison.csv", output_rows, fields)
++    return "\n".join(report) + "\n"
++
++
+ def build_report(t, args):
+     queries = normalize(t.get("queries.csv", []), "Top queries")
+     pages = normalize(t.get("pages.csv", []), "Top pages")
+@@ -280,8 +378,10 @@ def write_csv(path, rows, fields):
+ def main():
+     ap = argparse.ArgumentParser(description="Find Search Console pages and queries close to page one.")
+     ap.add_argument("export", help="GSC Performance export: the .zip or an unzipped folder")
+-    ap.add_argument("--out", default="striking-distance-report.md", help="Markdown report path")
+-    ap.add_argument("--csv", metavar="DIR", help="also write striking-distance pages/queries as CSV to DIR")
++    ap.add_argument("--before", metavar="EXPORT", help="compare pages against this earlier GSC export")
++    ap.add_argument("--page", metavar="URL", help="with --before, track one exact URL from Pages.csv")
++    ap.add_argument("--out", help="Markdown report path")
++    ap.add_argument("--csv", metavar="DIR", help="also write report rows as CSV to DIR")
+     ap.add_argument("--min-pos", type=float, default=8, help="lowest average position to include (default 8)")
+     ap.add_argument("--max-pos", type=float, default=20, help="highest average position to include (default 20)")
+     ap.add_argument("--min-impr", type=int, default=20, help="minimum impressions for a page (default 20)")
+@@ -289,8 +389,19 @@ def main():
+     ap.add_argument("--target", type=int, default=3, help="position used to estimate potential clicks (default 3)")
+     ap.add_argument("--top", type=int, default=15, help="rows per table (default 15)")
+     args = ap.parse_args()
++    if args.out is None:
++        args.out = "page-comparison.md" if args.before else "striking-distance-report.md"
+ 
++    if args.page and not args.before:
++        ap.error("--page requires --before")
+     tables = read_export(args.export)
++    if args.before:
++        if args.top < 1:
++            ap.error("--top must be positive")
++        report = compare_exports(read_export(args.before), tables, args)
++        Path(args.out).write_text(report, encoding="utf-8")
++        print(f"Wrote {args.out}")
++        return
+     if not any(k in tables for k in ("queries.csv", "pages.csv")):
+         sys.exit("No Queries.csv or Pages.csv found. Export from Search Console > Performance > Export.")
+     sample = (tables.get("pages.csv") or tables.get("queries.csv") or [{}])[0]
+diff --git a/test_page_comparison.py b/test_page_comparison.py
+new file mode 100644
+index 0000000..3b760fb
+--- /dev/null
++++ b/test_page_comparison.py
+@@ -0,0 +1,66 @@
++import csv
++import subprocess
++import sys
++import tempfile
++import unittest
++import zipfile
++from pathlib import Path
++
++SCRIPT = Path(__file__).with_name("gsc_striking_distance.py").resolve()
++PAGE = "https://example.com/guide"
++
++
++class PageComparisonTests(unittest.TestCase):
++    def setUp(self):
++        temp = tempfile.TemporaryDirectory()
++        self.addCleanup(temp.cleanup)
++        self.root = Path(temp.name)
++        self.before = self.root / "before"
++        self.before.mkdir()
++        (self.before / "Pages.csv").write_text(
++            "Top pages,Clicks,Impressions,Position\n"
++            f"{PAGE},1,100,9.6\n{PAGE}-missing,0,30,12\n", encoding="utf-8")
++        (self.before / "Chart.csv").write_text(
++            "Date\n2026-10-01\n2026-10-02\n", encoding="utf-8")
++        self.after = self.root / "after.zip"
++        with zipfile.ZipFile(self.after, "w") as archive:
++            archive.writestr("Pages.csv", "Top pages,Clicks,Impressions,Position\n"
++                             f"{PAGE},8,200,3.1\n{PAGE}-new,0,0,0\n")
++            archive.writestr("Chart.csv", "Date\n2026-10-04\n2026-10-03\n")
++
++    def run_cli(self, *options):
++        return subprocess.run([sys.executable, str(SCRIPT), str(self.after), *options],
++                              cwd=self.root, capture_output=True, text=True)
++
++    def test_earlier_opportunities_survive_rank_change_and_mark_missing_rows(self):
++        result = self.run_cli("--before", str(self.before), "--top", "1", "--csv", "out")
++        self.assertEqual(result.returncode, 0, result.stderr)
++        report = (self.root / "page-comparison.md").read_text(encoding="utf-8")
++        self.assertIn("1 → 8 (+7)", report)
++        self.assertIn("1.00% → 4.00% (+3.00 pp)", report)
++        self.assertIn("9.6 → 3.1 (-6.5)", report)
++        self.assertIn("2026-10-03 to 2026-10-04", report)
++        self.assertNotIn(PAGE + "-missing", report)
++        with (self.root / "out/page-comparison.csv").open(encoding="utf-8") as data:
++            kept, missing = list(csv.DictReader(data))
++        self.assertEqual(kept["clicks_change"], "7")
++        self.assertEqual(missing["page"], PAGE + "-missing")
++        self.assertEqual(missing["clicks_before"], "0")
++        self.assertEqual(missing["clicks_after"], "")
++        self.assertEqual(missing["clicks_change"], "")
++
++    def test_exact_url_can_be_new_with_zero_impressions(self):
++        result = self.run_cli("--before", str(self.before), "--page", PAGE + "-new")
++        self.assertEqual(result.returncode, 0, result.stderr)
++        report = (self.root / "page-comparison.md").read_text(encoding="utf-8")
++        self.assertIn("| — → 0 | — → 0 | — → — | — → — |", report)
++
++    def test_unknown_page_returns_error(self):
++        result = self.run_cli("--before", str(self.before), "--page", PAGE + "-typo")
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn("missing from both exports", result.stderr)
++        self.assertFalse((self.root / "page-comparison.md").exists())
++
++
++if __name__ == "__main__":
++    unittest.main()
